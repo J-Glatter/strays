@@ -10,6 +10,8 @@ struct PanelModel: Equatable {
     var battery: BatteryModel?
     var warnings: [SystemWarning] = []
     var hidden: [RowModel] = []
+    var duplicates: [DuplicateModel] = []
+    var cleanup: CleanupModel?
     var exposedCount = 0
     var sessions: [SessionModel] = []
     var sessionsSummary = ""
@@ -21,7 +23,27 @@ struct PanelModel: Equatable {
     var showIgnored = false
 }
 
+struct DuplicateModel: Identifiable, Equatable, Sendable {
+    var id: String
+    /// "5 copies of server/index.js in games/panel-skirmish"
+    var text: String
+    var extraCount: Int
+}
+
+struct CleanupModel: Equatable, Sendable {
+    /// "Auto-cleanup stops 3 leftovers from ended Claude sessions in 8 min"
+    var text: String
+    var names: String
+}
+
 struct BatteryModel: Equatable, Sendable {
+    struct EnergyRow: Equatable, Sendable, Identifiable {
+        var name: String
+        var wh: String
+        var fraction: Double
+        var id: String { name }
+    }
+
     struct Point: Equatable, Sendable {
         var x: Double
         var y: Double
@@ -39,6 +61,12 @@ struct BatteryModel: Equatable, Sendable {
     var flatLine: String?
     var flatDetail: String?
     var flatCount = 0
+    /// "Since you unplugged 2h 10m ago" / "Last time on battery, 12:15–15:31"
+    var energyTitle: String?
+    var energyRows: [EnergyRow] = []
+    var energyNote: String?
+    /// "Last sleep 23:00–08:49 (9h 49m): 34 background wake-ups, used 2%"
+    var sleepLine: String?
 }
 
 struct RowModel: Identifiable, Equatable, Sendable {
@@ -68,6 +96,8 @@ struct RowModel: Identifiable, Equatable, Sendable {
     var stopLabel: String
     var stopHelp: String
     var canForceKill: Bool
+    /// When set, stopping needs a second click and this explains what will happen.
+    var confirm: String? = nil
 }
 
 struct ContainerModel: Identifiable, Equatable, Sendable {
@@ -104,6 +134,7 @@ struct PanelInputs {
     var report: Report
     var battery: BatteryState?
     var story: BatteryStory?
+    var ledger: EnergyLedger?
     var warnings: [SystemWarning]
     var containers: [DockerContainer]
     var pages: [String: [DevToolsPage]]
@@ -112,6 +143,7 @@ struct PanelInputs {
     var showIgnored: Bool
     var showLegend: Bool
     var idleAge: TimeInterval
+    var pendingCleanup: [String: Date] = [:]
     var now = Date()
 }
 
@@ -128,6 +160,21 @@ extension PanelModel {
         battery = Self.battery(input, strays: hidden + machines)
         warnings = input.warnings
         self.hidden = hidden.map { Self.row($0, input) }
+        let visibleIds = Set(hidden.map(\.id))
+        duplicates = r.duplicates.compactMap { dup in
+            let ids = dup.strayIds.filter(visibleIds.contains)
+            guard ids.count > 1 else { return nil }
+            let place = dup.place.map { " in \($0)" } ?? ""
+            return DuplicateModel(id: dup.id, text: "\(ids.count) copies of \(dup.title)\(place)", extraCount: ids.count - 1)
+        }
+        if let soonest = input.pendingCleanup.values.min() {
+            let names = hidden.filter { input.pendingCleanup[$0.id] != nil }.map(\.title)
+            let minutes = max(1, Int((soonest.timeIntervalSince(input.now) / 60).rounded(.up)))
+            cleanup = CleanupModel(
+                text: "Auto-cleanup stops \(names.count) leftover\(names.count == 1 ? "" : "s") from ended Claude sessions in \(minutes) min",
+                names: names.prefix(4).joined(separator: ", ") + (names.count > 4 ? " and \(names.count - 4) more" : "")
+            )
+        }
         exposedCount = hidden.filter(\.isExposed).count
         self.machines = machines.map { Self.row($0, input) }
         ignoredCount = ignored.count
@@ -211,6 +258,32 @@ extension PanelModel {
                 model.flatLine = line
             }
             model.flatDetail = story.lastDeathDetail
+            if let sleep = story.lastSleep {
+                let t = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+                var line = "Last sleep \(t(sleep.start))–\(t(sleep.end)) (\(Fmt.duration(sleep.end.timeIntervalSince(sleep.start)))): "
+                line += "\(sleep.darkWakes) brief background wake-up\(sleep.darkWakes == 1 ? "" : "s")"
+                if let used = sleep.used { line += ", used \(used)%" }
+                model.sleepLine = line
+            }
+        }
+
+        if let ledger = input.ledger, ledger.total >= 0.05 {
+            let t = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+            if b.onExternalPower {
+                model.energyTitle = "Energy used last time on battery (\(t(ledger.since))–\(t(ledger.savedAt)))"
+            } else if ledger.fromUnplug {
+                model.energyTitle = "Energy used since you unplugged \(Fmt.duration(input.now.timeIntervalSince(ledger.since))) ago"
+            } else {
+                model.energyTitle = "Energy used since \(t(ledger.since)) (when Strays started measuring)"
+            }
+            let top = ledger.top(5)
+            let maxWh = top.first?.wh ?? 1
+            model.energyRows = top.map { .init(name: $0.name, wh: Fmt.energy($0.wh), fraction: $0.wh / maxWh) }
+            var note = "Measured \(Fmt.energy(ledger.total)) across your apps"
+            if !b.onExternalPower, let start = ledger.startPercent, let capacity = b.capacityWh, start > b.percent {
+                note += " of ~\(Fmt.energy(Double(start - b.percent) / 100 * capacity)) the battery has supplied"
+            }
+            model.energyNote = note + ". The rest is the screen, graphics and macOS itself, which can't be measured per app."
         }
         return model
     }
@@ -344,15 +417,27 @@ extension PanelModel {
             cwd: s.cwd == "/" ? nil : s.cwd,
             facts: facts,
             pages: pages,
-            containers: isDocker ? input.containers.map {
-                ContainerModel(id: $0.id, name: $0.name, subtitle: "\($0.image) · \($0.status)", stopping: input.stopping.contains($0.id))
+            containers: isDocker ? input.containers.map { c in
+                let usage = [c.cpu.map { "\($0) CPU" }, c.memory].compactMap { $0 }.joined(separator: " · ")
+                return ContainerModel(id: c.id, name: c.name,
+                                      subtitle: ([usage.isEmpty ? nil : usage, c.image, c.status].compactMap { $0 }).joined(separator: " · "),
+                                      stopping: input.stopping.contains(c.id))
             } : [],
             stopping: input.stopping.contains(s.id),
             ignored: input.ignored.contains(s.signature),
             stopLabel: stopLabel,
             stopHelp: stopHelp,
-            canForceKill: s.kind != .simulator && s.kind != .vm
+            canForceKill: s.kind != .simulator && s.kind != .vm,
+            confirm: isDocker ? dockerConfirm(input.containers) : nil
         )
+    }
+
+    /// Quitting Docker stops every container; say which before doing it.
+    static func dockerConfirm(_ containers: [DockerContainer]) -> String {
+        guard !containers.isEmpty else { return "Quit Docker Desktop? Its VM stops. (Container list not loaded yet.)" }
+        let names = containers.map(\.name)
+        return "Quit Docker Desktop? This also stops \(containers.count) container\(containers.count == 1 ? "" : "s"): "
+            + names.prefix(6).joined(separator: ", ") + (names.count > 6 ? " and \(names.count - 6) more" : "") + "."
     }
 
     static func secondary(watts: Double, memory: UInt64) -> String {

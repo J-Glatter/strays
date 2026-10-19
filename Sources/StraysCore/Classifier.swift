@@ -16,13 +16,35 @@ public enum Classifier {
         let sessions = ctx.claudeSessions()
         let orphans = ctx.orphans()
         let blockers = ctx.sleepBlockers(assertions)
+        let hidden = (browsers + orphans).sorted(by: Stray.byImpact)
         return Report(
-            hidden: (browsers + orphans).sorted(by: Stray.byImpact),
+            hidden: hidden,
             claudeSessions: sessions.sorted { ($0.totalWatts, $1.started) > ($1.totalWatts, $0.started) },
             sleepBlockers: blockers,
             machines: machines.sorted(by: Stray.byImpact),
+            duplicates: duplicates(in: hidden),
             generatedAt: now
         )
+    }
+
+    /// Same kind, same folder, same command (ignoring port numbers) = copies of one thing.
+    static func duplicates(in hidden: [Stray]) -> [DuplicateGroup] {
+        let groups = Dictionary(grouping: hidden) { s in
+            "\(s.kind.rawValue)|\(s.cwd ?? s.project ?? "")|\(withoutPorts(s.title))"
+        }
+        return groups.compactMap { key, members -> DuplicateGroup? in
+            guard members.count > 1 else { return nil }
+            let sorted = members.sorted { $0.started < $1.started }
+            let newest = sorted[sorted.count - 1]
+            return DuplicateGroup(id: key, title: withoutPorts(newest.title), place: newest.project,
+                                  strayIds: sorted.map(\.id), keepId: newest.id)
+        }
+        .sorted { ($0.strayIds.count, $1.id) > ($1.strayIds.count, $0.id) }
+    }
+
+    /// "http.server 8733" → "http.server"
+    static func withoutPorts(_ title: String) -> String {
+        title.split(separator: " ").filter { !($0.count >= 2 && $0.allSatisfy(\.isNumber)) }.joined(separator: " ")
     }
 
     static let shellLeaders: Set<String> = ["zsh", "bash", "sh", "fish", "dash", "ksh", "login", "tmux", "screen", "claude"]

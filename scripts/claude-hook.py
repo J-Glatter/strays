@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Add or remove Strays' SessionEnd hook in ~/.claude/settings.json.
+"""Add or remove Strays' Claude Code hooks in ~/.claude/settings.json.
 
     claude-hook.py status | install | uninstall
 
-Only touches the hooks.SessionEnd entry it owns. Key order and 2-space formatting are kept
+SessionStart tells a new session what's already running in its project; SessionEnd records what
+an ending session leaves running. Only touches the entries it owns. Key order and 2-space formatting are kept
 (Claude Code writes the file the same way), a backup goes next to it, and the write is atomic.
 """
 import json
@@ -12,7 +13,14 @@ import shutil
 import sys
 
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
-COMMAND = '"$HOME/.local/bin/strays" --session-end 2>/dev/null || true'
+HOOKS = {
+    "SessionStart": "--session-start",
+    "SessionEnd": "--session-end",
+}
+
+
+def command(flag):
+    return '"$HOME/.local/bin/strays" ' + flag + " 2>/dev/null || true"
 
 
 def load():
@@ -33,14 +41,18 @@ def save(data, trailing_newline):
     os.replace(tmp, SETTINGS)
 
 
-def ours(hook):
-    command = hook.get("command", "")
-    return "strays" in command and "--session-end" in command
+def ours(hook, flag):
+    cmd = hook.get("command", "")
+    return "strays" in cmd and flag in cmd
 
 
-def installed(data):
-    groups = data.get("hooks", {}).get("SessionEnd", [])
-    return any(ours(h) for g in groups for h in g.get("hooks", []))
+def installed(data, event):
+    groups = data.get("hooks", {}).get(event, [])
+    return any(ours(h, HOOKS[event]) for g in groups for h in g.get("hooks", []))
+
+
+def all_installed(data):
+    return all(installed(data, e) for e in HOOKS)
 
 
 def main():
@@ -48,38 +60,46 @@ def main():
     data, newline = load()
 
     if action == "status":
-        print("installed" if installed(data) else "not installed")
-        return 0 if installed(data) else 1
+        for event in HOOKS:
+            print(f"{event}: " + ("installed" if installed(data, event) else "not installed"))
+        return 0 if all_installed(data) else 1
 
     if action == "install":
-        if installed(data):
+        missing = [e for e in HOOKS if not installed(data, e)]
+        if not missing:
             print("already installed")
             return 0
-        entry = {"hooks": [{"type": "command", "command": COMMAND, "timeout": 10}]}
-        data.setdefault("hooks", {}).setdefault("SessionEnd", []).append(entry)
+        for event in missing:
+            entry = {"hooks": [{"type": "command", "command": command(HOOKS[event]), "timeout": 10}]}
+            data.setdefault("hooks", {}).setdefault(event, []).append(entry)
         save(data, newline)
-        print("installed: new Claude Code sessions will report what they leave running")
+        print("installed " + ", ".join(missing) + " (applies to Claude sessions started from now on)")
         return 0
 
     if action == "uninstall":
         hooks = data.get("hooks", {})
-        groups = hooks.get("SessionEnd", [])
-        kept = []
-        for g in groups:
-            g["hooks"] = [h for h in g.get("hooks", []) if not ours(h)]
-            if g["hooks"]:
-                kept.append(g)
-        if len(kept) == len(groups) and not installed(data):
+        removed = []
+        for event, flag in HOOKS.items():
+            groups = hooks.get(event, [])
+            kept = []
+            for g in groups:
+                before = len(g.get("hooks", []))
+                g["hooks"] = [h for h in g.get("hooks", []) if not ours(h, flag)]
+                if len(g["hooks"]) < before:
+                    removed.append(event)
+                if g["hooks"]:
+                    kept.append(g)
+            if kept:
+                hooks[event] = kept
+            else:
+                hooks.pop(event, None)
+        if not removed:
             print("not installed")
             return 0
-        if kept:
-            hooks["SessionEnd"] = kept
-        else:
-            hooks.pop("SessionEnd", None)
         if not hooks:
             data.pop("hooks", None)
         save(data, newline)
-        print("removed")
+        print("removed " + ", ".join(sorted(set(removed))))
         return 0
 
     print(__doc__)

@@ -16,11 +16,13 @@ No dependencies.
   - `Stopper.swift`: TERM → wait → KILL, start-time guarded
   - `Provenance.swift`: launch chains (`Launch`, `ProvenanceStore`), SessionEnd ledger, `StraysPaths`, `ActivityLog`
   - `SessionEnd.swift`: what an ending Claude session leaves behind (hook side), and what survived (app side)
-  - `History.swift`: `pmset -g log` parser (charge points, battery deaths), 5-minute samples, `BatteryStory`
+  - `History.swift`: `pmset -g log` parser (charge points, battery deaths, sleep sessions), 5-minute samples, `BatteryStory`
+  - `SessionStart.swift`: what's already running in a new session's project (SessionStart hook)
+  - `Energy.swift`: `EnergyLedger` (Wh per app since unplugging) and `AutoCleanup` eligibility
 - `Sources/Strays`: the app. `main.swift` dispatches CLI vs GUI; `Store` runs the refresh loop, history,
   hot tracking and session-end follow-ups; `PanelModel` turns a scan into display strings; `Notifier` wraps
   UserNotifications; `ClaudeHook` runs the bundled `scripts/claude-hook.py`.
-- State lives in `~/Library/Application Support/Strays/`: provenance.json, sessions.jsonl, history.jsonl, activity.log.
+- State lives in `~/Library/Application Support/Strays/`: provenance.json, sessions.jsonl, history.jsonl, energy.json, activity.log.
 - `Tests/StraysCoreTests`: classifier and namer tests over synthetic process tables.
 
 ## Commands
@@ -45,4 +47,7 @@ build/Strays.app/Contents/MacOS/Strays --window --float --visibility-selftest
 - `Text("\(number)")` localises with thousands separators. Use `Text(verbatim:)` for pids and ports.
 - Never edit ~/.claude/settings.json except through `scripts/claude-hook.py`, and test changes to it on a copy
   first (`HOME=<tmp> python3 scripts/claude-hook.py install`).
-- `STRAYS_HOT_AFTER=<seconds>` shortens the hot-notification threshold for testing.
+- `STRAYS_HOT_AFTER=<seconds>` shortens the hot-notification threshold; `STRAYS_DEATH_LOOKBACK=<seconds>`
+  widens the battery-death report window. Both are for testing.
+- Panel snapshots: always pass `--snapshot` (it pins the panel open). Otherwise a sleeping display or covering
+  windows make the window read as closed and nothing renders.

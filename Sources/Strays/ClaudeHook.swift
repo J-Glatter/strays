@@ -10,9 +10,9 @@ enum ClaudeHook {
     }
 
     static var isInstalled: Bool {
-        // The command is `"$HOME/.local/bin/strays" --session-end`, so match the two parts separately.
+        // Commands look like `"$HOME/.local/bin/strays" --session-end`, so match the parts separately.
         guard let text = try? String(contentsOf: settings, encoding: .utf8) else { return false }
-        return text.contains("--session-end") && text.contains("strays")
+        return text.contains("strays") && text.contains("--session-end") && text.contains("--session-start")
     }
 
     /// Returns a one-line result for the footer.

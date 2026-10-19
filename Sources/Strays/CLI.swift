@@ -5,7 +5,7 @@ import StraysCore
 /// sessions to check what they've left running.
 enum CLI {
     static let flags: Set<String> = [
-        "--list", "--json", "--stop", "--port", "--battery", "--session-end", "--bench",
+        "--list", "--json", "--stop", "--port", "--battery", "--session-end", "--session-start", "--update", "--bench",
         "--help", "-h", "--unregister-login-item",
     ]
 
@@ -23,7 +23,9 @@ enum CLI {
               strays --stop <pid>  stop the whole group that pid belongs to (SIGTERM, then SIGKILL after 3 s)
               strays --port <n>    what's listening on port n, and what started it
               strays --battery     when the battery last ran flat, and how fast it drained
-              strays --session-end for Claude Code's SessionEnd hook (reads the hook JSON on stdin)
+              strays --update      pull the latest source (if it has a git remote) and reinstall
+              strays --session-start / --session-end
+                                   for Claude Code's hooks (read the hook JSON on stdin)
               Strays.app           the menu bar app (this binary with no flags)
             """)
             return 0
@@ -33,6 +35,8 @@ enum CLI {
             return 0
         }
         if args.contains("--session-end") { return sessionEnd() }
+        if args.contains("--session-start") { return sessionStart() }
+        if args.contains("--update") { return update() }
         if args.contains("--battery") { return battery() }
         if let i = args.firstIndex(of: "--port") { return port(i + 1 < args.count ? UInt16(args[i + 1]) : nil) }
 
@@ -116,6 +120,57 @@ enum CLI {
         return 0
     }
 
+    // MARK: --session-start
+
+    /// Called by Claude Code's SessionStart hook. Prints context for the new session listing what's
+    /// already running in its project, or nothing. Never fails loudly.
+    private static func sessionStart() -> Int32 {
+        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let input = (try? JSONDecoder().decode(SessionEnd.HookInput.self, from: stdin)) ?? SessionEnd.HookInput()
+        let cwd = input.cwd ?? FileManager.default.currentDirectoryPath
+        let result = Engine().scanSync(warm: false)
+        let items = SessionStart.running(in: result.report, cwd: cwd, projectRoot: LiveInspector().projectRoot(of: cwd))
+        if let context = SessionStart.context(for: items, duplicates: result.report.duplicates) {
+            print(SessionStart.hookOutput(context: context))
+        }
+        return 0
+    }
+
+    // MARK: --update
+
+    /// Pulls the source `install.sh` was run from (when it has a remote) and reinstalls.
+    private static func update() -> Int32 {
+        guard let source = UserDefaults(suiteName: "com.glatter.strays")?.string(forKey: "sourcePath"),
+              FileManager.default.fileExists(atPath: source + "/install.sh") else {
+            print("don't know where the source is; run ./install.sh from the strays folder once")
+            return 1
+        }
+        print("source: \(source)")
+        if run("/usr/bin/git", ["-C", source, "rev-parse", "--abbrev-ref", "@{u}"], quiet: true) == 0 {
+            guard run("/usr/bin/git", ["-C", source, "pull", "--ff-only"]) == 0 else {
+                print("git pull failed; not reinstalling")
+                return 1
+            }
+        } else {
+            print("no git remote configured; rebuilding the local source as-is")
+        }
+        return run("/bin/bash", [source + "/install.sh", "--yes"])
+    }
+
+    @discardableResult
+    private static func run(_ tool: String, _ args: [String], quiet: Bool = false) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        if quiet {
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+        }
+        do { try p.run() } catch { return 127 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
     // MARK: --port
 
     private static func port(_ port: UInt16?) -> Int32 {
@@ -164,6 +219,16 @@ enum CLI {
             print(line)
         }
         if let detail = story.lastDeathDetail { print(detail) }
+        if let sleep = story.lastSleep {
+            var line = "Last sleep: \(sleep.start.formatted(date: .omitted, time: .shortened))–\(sleep.end.formatted(date: .omitted, time: .shortened))"
+            line += " (\(Fmt.duration(sleep.end.timeIntervalSince(sleep.start)))), \(sleep.darkWakes) background wake-ups"
+            if let used = sleep.used { line += ", used \(used)%" }
+            print(line)
+        }
+        if let ledger = EnergyLedger.load(), ledger.total > 0.05 {
+            print("Energy by app since \(ledger.since.formatted(date: .abbreviated, time: .shortened)) (measured by the menu bar app):")
+            for (name, wh) in ledger.top(8) { print("  \(Fmt.energy(wh))  \(name)") }
+        }
         return 0
     }
 
@@ -185,6 +250,9 @@ enum CLI {
         }
 
         section("Hidden & orphaned", r.hidden.map(lines))
+        section("Duplicates", r.duplicates.map { d in
+            ["  \(d.strayIds.count) copies of \(d.title)" + (d.place.map { " in \($0)" } ?? "") + " (newest kept by 'keep newest')"]
+        })
         section("Claude sessions", r.claudeSessions.map { s in
             let state = s.isIdle ? "idle" : "working"
             var extra: [String] = []

@@ -30,12 +30,14 @@ cp -R build/Strays.app "$APP"
 
 mkdir -p "$HOME/.local/bin"
 ln -sf "$APP/Contents/MacOS/Strays" "$HOME/.local/bin/strays"
+# So `strays --update` knows where to pull and rebuild from.
+defaults write com.glatter.strays sourcePath "$(pwd)"
 
 # Claude Code hook: when a session ends, note what it leaves running so Strays can tell you.
 if [[ -d "$HOME/.claude" ]] && ! python3 scripts/claude-hook.py status >/dev/null 2>&1; then
   answer="y"
   if [[ "${1:-}" != "--yes" && -t 0 ]]; then
-    read -r -p "Add a Claude Code hook so Strays can tell you what ended sessions leave running? [Y/n] " answer
+    read -r -p "Add Claude Code hooks (tell new sessions what's already running; report what ended ones leave behind)? [Y/n] " answer
   fi
   if [[ ! "$answer" =~ ^[Nn] ]]; then
     python3 scripts/claude-hook.py install

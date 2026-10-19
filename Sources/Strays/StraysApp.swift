@@ -65,6 +65,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if args.contains("--tall") { PopoverView.maxListHeight = 4_000 }
         PopoverView.expandFirst = args.contains("--expand-first")
         if args.contains("--legend") { Store.shared.showLegend = true }
+        if args.contains("--snapshot") {
+            Store.shared.pinnedOpen = true
+            Store.shared.setOpen(true)
+        }
         let host = NSHostingView(rootView: PopoverView().environmentObject(Store.shared))
         window.contentView = host
         window.center()

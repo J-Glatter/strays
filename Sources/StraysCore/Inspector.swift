@@ -60,6 +60,9 @@ public final class LiveInspector: ProcessInspector {
         return parts.count > 1 ? "\(os) \(parts.dropFirst().joined(separator: "."))" : String(os)
     }
 
+    /// The git repository containing `dir`, if any.
+    public func projectRoot(of dir: String) -> String? { gitRoot(of: dir) }
+
     private func gitRoot(of dir: String) -> String? {
         if let cached = gitRoots[dir] { return cached }
         var current = dir

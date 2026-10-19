@@ -21,7 +21,8 @@ struct PopoverView: View {
                     if panel.showLegend { LegendView() }
                     ForEach(panel.warnings) { WarningRow(warning: $0, store: store) }
                     if let battery = panel.battery { BatterySection(model: battery).equatable() }
-                    HiddenSection(rows: panel.hidden, exposed: panel.exposedCount, loaded: panel.loaded, store: store)
+                    HiddenSection(rows: panel.hidden, duplicates: panel.duplicates, cleanup: panel.cleanup,
+                                  exposed: panel.exposedCount, loaded: panel.loaded, store: store)
                     if !panel.sessions.isEmpty {
                         ClaudeSection(sessions: panel.sessions, summary: panel.sessionsSummary, idleCount: panel.idleSessionCount, store: store)
                     }
@@ -171,6 +172,7 @@ private struct FooterView: View {
     @State private var notifyHot = Prefs.notifyHot
     @State private var notifyLeftovers = Prefs.notifyLeftovers
     @State private var hookInstalled = ClaudeHook.isInstalled
+    @State private var cleanupHours = Prefs.autoCleanupHours
     @State private var hookMessage: String?
 
     var body: some View {
@@ -183,11 +185,18 @@ private struct FooterView: View {
                        isOn: Binding(get: { notifyHot }, set: { notifyHot = $0; Prefs.notifyHot = $0 }))
                 Toggle("Notify when a Claude session leaves things running",
                        isOn: Binding(get: { notifyLeftovers }, set: { notifyLeftovers = $0; Prefs.notifyLeftovers = $0 }))
+                Picker("Auto-stop leftovers from ended Claude sessions",
+                       selection: Binding(get: { cleanupHours }, set: { cleanupHours = $0; Prefs.autoCleanupHours = $0 })) {
+                    Text("Off").tag(0)
+                    Text("Idle and older than 6 hours").tag(6)
+                    Text("Idle and older than 1 day").tag(24)
+                    Text("Idle and older than 3 days").tag(72)
+                }
                 Divider()
                 if hookInstalled {
-                    Text("Claude Code hook: installed")
+                    Text("Claude Code hooks: installed")
                 } else {
-                    Button("Set up Claude Code hook…") {
+                    Button("Set up Claude Code hooks…") {
                         hookMessage = ClaudeHook.install()
                         hookInstalled = ClaudeHook.isInstalled
                     }
@@ -309,6 +318,31 @@ private struct BatterySection: View, Equatable {
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
             }
+            if !model.energyRows.isEmpty, let title = model.energyTitle {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.caption.weight(.medium))
+                    ForEach(model.energyRows) { row in
+                        HStack(spacing: 6) {
+                            Text(row.name).font(.caption).lineLimit(1).frame(width: 130, alignment: .leading)
+                            GeometryReader { geo in
+                                Capsule()
+                                    .fill(row.name == "Hidden & orphaned" ? Color.orange.opacity(0.7) : Color.accentColor.opacity(0.6))
+                                    .frame(width: max(3, geo.size.width * row.fraction), height: 6)
+                                    .frame(maxHeight: .infinity, alignment: .center)
+                            }
+                            .frame(height: 10)
+                            Text(row.wh).font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 52, alignment: .trailing)
+                        }
+                    }
+                    if let note = model.energyNote {
+                        Text(note).font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.top, 4)
+            }
+            if let sleep = model.sleepLine {
+                Label(sleep, systemImage: "moon.zzz").font(.caption).foregroundStyle(.secondary)
+            }
             if let flat = model.flatLine {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Image(systemName: "battery.0percent").foregroundStyle(.red)
@@ -370,6 +404,8 @@ private struct Sparkline: View {
 
 private struct HiddenSection: View {
     let rows: [RowModel]
+    let duplicates: [DuplicateModel]
+    let cleanup: CleanupModel?
     let exposed: Int
     let loaded: Bool
     let store: Store
@@ -380,6 +416,26 @@ private struct HiddenSection: View {
                           blurb: "Still running after the terminal or Claude session that started them closed.") {
                 if rows.count > 1 {
                     ConfirmButton(label: "Stop all", confirmLabel: "Stop all \(rows.count)?") { store.stopAll(rows.map(\.id)) }
+                }
+            }
+            if let cleanup {
+                Callout(icon: "timer", tint: .blue) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(cleanup.text).font(.caption)
+                        Text(cleanup.names).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                } actions: {
+                    Button("Keep them") { store.keepPendingCleanup() }.buttonStyle(.link).font(.caption)
+                    Button("Stop now") { store.cleanupNow() }.buttonStyle(.link).font(.caption)
+                }
+            }
+            ForEach(duplicates) { dup in
+                Callout(icon: "square.on.square", tint: .purple) {
+                    Text(dup.text + ". Usually only one is needed.").font(.caption).fixedSize(horizontal: false, vertical: true)
+                } actions: {
+                    ConfirmButton(label: "Keep newest, stop \(dup.extraCount)", confirmLabel: "Stop \(dup.extraCount) older?") {
+                        store.stopDuplicates(dup.id)
+                    }
                 }
             }
             if exposed > 0 {
@@ -457,6 +513,27 @@ private struct BlockerRow: View, Equatable {
 }
 
 // MARK: - Small pieces
+
+/// A tinted notice inside a section, with actions on the right.
+private struct Callout<Content: View, Actions: View>: View {
+    let icon: String
+    let tint: Color
+    @ViewBuilder var content: Content
+    @ViewBuilder var actions: Actions
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: icon).foregroundStyle(tint)
+            content
+            Spacer(minLength: 4)
+            HStack(spacing: 10) { actions }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(tint.opacity(0.1)))
+        .padding(.horizontal, 10)
+        .padding(.bottom, 4)
+    }
+}
 
 struct EmptyRow: View {
     let text: String

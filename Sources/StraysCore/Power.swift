@@ -49,6 +49,8 @@ public struct BatteryState: Codable, Hashable, Sendable {
     /// Whole-machine draw from the battery; only known while discharging.
     public var drawWatts: Double?
     public var minutesRemaining: Int?
+    /// Full-charge energy at today's battery health, roughly mAh × volts.
+    public var capacityWh: Double?
 }
 
 public enum Battery {
@@ -77,12 +79,17 @@ public enum Battery {
         if !external, let minutes = int("TimeRemaining"), minutes > 0, minutes < 65_535 {
             remaining = Int(minutes)
         }
+        var capacity: Double?
+        if let mAh = int("AppleRawMaxCapacity") ?? int("NominalChargeCapacity"), let mv = int("Voltage"), mAh > 0 {
+            capacity = Double(mAh) * Double(mv) / 1_000_000
+        }
         return BatteryState(
             percent: max > 0 ? Int((Double(current) / Double(max) * 100).rounded()) : Int(current),
             isCharging: bool("IsCharging"),
             onExternalPower: external,
             drawWatts: draw,
-            minutesRemaining: remaining
+            minutesRemaining: remaining,
+            capacityWh: capacity
         )
     }
 }

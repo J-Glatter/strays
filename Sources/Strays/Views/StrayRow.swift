@@ -7,6 +7,7 @@ struct StrayRow: View, Equatable {
     let store: Store
     @State private var expanded: Bool
     @State private var hovering = false
+    @State private var confirming = false
 
     init(row: RowModel, store: Store, expanded: Bool = false) {
         self.row = row
@@ -44,13 +45,31 @@ struct StrayRow: View, Equatable {
                 }
                 Spacer(minLength: 6)
                 Metrics(cpu: row.cpu, secondary: row.secondary, hot: row.hot)
-                StopButton(busy: row.stopping, help: row.stopHelp) { store.primaryAction(row.id) }
+                StopButton(busy: row.stopping, help: row.stopHelp) { primary() }
             }
             .contentShape(Rectangle())
             .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() } }
             .help("Click for details")
 
-            if expanded { StrayDetail(row: row, store: store) }
+            if confirming, let confirm = row.confirm {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(confirm).font(.caption).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button("Cancel") { confirming = false }
+                    Button(row.stopLabel) {
+                        confirming = false
+                        store.primaryAction(row.id)
+                    }
+                    .foregroundStyle(.red)
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.red.opacity(0.08)))
+                .padding(.leading, 28)
+            }
+
+            if expanded { StrayDetail(row: row, store: store, primary: primary) }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
@@ -60,13 +79,23 @@ struct StrayRow: View, Equatable {
                 .padding(.horizontal, 6)
         )
         .onHover { hovering = $0 }
-        .contextMenu { StrayMenu(row: row, store: store) }
+        .contextMenu { StrayMenu(row: row, store: store, primary: primary) }
+    }
+
+    /// Things with side effects worth spelling out (quitting Docker stops every container) ask first.
+    private func primary() {
+        if row.confirm != nil {
+            withAnimation(.easeOut(duration: 0.15)) { confirming = true }
+        } else {
+            store.primaryAction(row.id)
+        }
     }
 }
 
 private struct StrayDetail: View {
     let row: RowModel
     let store: Store
+    let primary: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -136,7 +165,7 @@ private struct StrayDetail: View {
             }
 
             HStack(spacing: 14) {
-                Button(row.stopLabel) { store.primaryAction(row.id) }
+                Button(row.stopLabel, action: primary)
                     .help(row.stopHelp)
                 if row.canForceKill {
                     Button("Force kill") { store.stop(row.id, force: true) }
@@ -183,9 +212,10 @@ private struct ContainerRow: View {
 private struct StrayMenu: View {
     let row: RowModel
     let store: Store
+    let primary: () -> Void
 
     var body: some View {
-        Button(row.stopLabel) { store.primaryAction(row.id) }
+        Button(row.stopLabel, action: primary)
         if row.canForceKill {
             Button("Force kill") { store.stop(row.id, force: true) }
         }

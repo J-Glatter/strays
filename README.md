@@ -13,11 +13,11 @@ headless Chromes rendering a dashboard nobody was looking at were burning ~7 W b
 
 | Section | How it's detected |
 |---|---|
-| **Battery** | Charge over the last 24 h, when it last ran flat and how fast it drained (from macOS's power log plus Strays' own 5-minute samples), and how much of the current draw is hidden processes. |
-| **Hidden & orphaned** | Your processes reparented to launchd whose session's shell has exited, or that Claude Code started (its environment, or what Strays saw launch them). Grouped with their children. Automation browsers: Chrome/Chromium/Edge/Firefox started with `--headless`, `--remote-debugging-port` or `--enable-automation` (your normal Chrome isn't touched); open pages are read from the DevTools endpoint. Servers other devices can reach are called out, with one click to stop them all. |
+| **Battery** | Charge over the last 24 h; **energy used per app since you unplugged** (Chrome 9 Wh, hidden processes 6 Wh, …, measured from the kernel's per-process energy counters); last night's sleep (how many background wake-ups, how much it used); when it last ran flat and how fast; and how much of the current draw is hidden processes. |
+| **Hidden & orphaned** | Your processes reparented to launchd whose session's shell has exited, or that Claude Code started (its environment, or what Strays saw launch them). Grouped with their children. Automation browsers: Chrome/Chromium/Edge/Firefox started with `--headless`, `--remote-debugging-port` or `--enable-automation` (your normal Chrome isn't touched); open pages are read from the DevTools endpoint. Servers other devices can reach are called out, with one click to stop them all. **Duplicates** (several copies of the same command in the same folder) are grouped, with "Keep newest, stop the rest". |
 | **Claude sessions** | Every running `claude`, its project, idle vs working, tool (MCP) servers, and background tasks older than 30 s. "End N idle" closes sessions idle for over a day. |
 | **Keeping the Mac awake** | Power assertions (`caffeinate`, apps), with the Claude session that started them. macOS's own daemons are filtered out. |
-| **VMs & simulators** | Docker Desktop (+ containers), OrbStack, Colima/Lima, UTM, Parallels, VirtualBox, Tart, other Virtualization.framework VMs, booted iOS simulators, Android emulators. |
+| **VMs & simulators** | Docker Desktop (+ each container's CPU and memory; quitting lists the containers it will stop first), OrbStack, Colima/Lima, UTM, Parallels, VirtualBox, Tart, other Virtualization.framework VMs, booted iOS simulators, Android emulators. |
 
 Every row says what it is in plain words, for example "Server left by a Claude session · 61d · games/panel-skirmish".
 Click a row for a labelled breakdown: what it is, what started it (including the **launch chain**, e.g.
@@ -37,21 +37,33 @@ hidden is using power (sustained ≥15% CPU or ≥1 W).
 
 - **Something hidden drains the battery:** stayed hot for 10 minutes on battery. Buttons: *Stop it*, *Ignore it*.
 - **A Claude session left things running:** see below. Buttons: *Stop them*, *Keep running*.
+- **The Mac ran out of battery:** sent after it comes back, with how fast it drained and, if Strays was
+  measuring, the biggest energy users during that discharge.
+- **Auto-cleanup** (opt-in, gear menu → *Auto-stop leftovers*): leftovers from *ended* Claude sessions
+  that are idle and older than 6 h, 1 day or 3 days. Announced 10 minutes before stopping, with
+  *Stop now* and *Keep them* buttons, and shown in the panel. Anything ignored is never touched.
 
 Both can be switched off in the gear menu. macOS asks for permission on first launch. If you missed
 the prompt, turn Strays on in System Settings → Notifications. `~/Library/Application Support/Strays/activity.log`
 records every notification sent, and every session-end check.
 
-### Claude Code session-end hook
+### Claude Code hooks
 
-`./install.sh` offers to add a `SessionEnd` hook to `~/.claude/settings.json`; the gear menu can add
-it later. When a session closes, the hook runs `strays --session-end`. That records the session's
+`./install.sh` offers to add two hooks to `~/.claude/settings.json`; the gear menu can add them later.
+
+**SessionStart** (`strays --session-start`): a new session is told what's already running in its
+project, e.g. "vite on :5180, pid 11825, running 4 days, left behind by an earlier Claude session".
+It's also told about any duplicates, and that it should reuse a running server instead of starting
+another copy on a new port. That pattern is how five panel-skirmish servers ended up running at once.
+If nothing is running in the project, it adds nothing.
+
+**SessionEnd** (`strays --session-end`): when a session closes, the hook runs `strays --session-end`. That records the session's
 background tasks and anything it started that has already detached, while the session's process is
 still alive to attribute them. A few seconds after the session has really exited, the app checks
 what survived and notifies you. The record also gives those processes an origin later, even for
-binaries whose environment macOS hides, such as Chrome and `/bin/sh`. The merge touches only this one hook
-entry, keeps the file's formatting, and leaves a `.strays-backup`. `./uninstall.sh` removes it again.
-The hook applies to Claude sessions started after it's installed.
+binaries whose environment macOS hides, such as Chrome and `/bin/sh`. The merge touches only Strays' own entries,
+keeps the file's formatting, and leaves a `.strays-backup`. `./uninstall.sh` removes them again.
+The hooks apply to Claude sessions started after they're installed.
 
 ## Install
 
@@ -75,7 +87,8 @@ strays               # the same scan, as text
 strays --json        # machine-readable
 strays --stop <pid>  # stop the group that pid belongs to (TERM → KILL)
 strays --port 3000   # what's listening on :3000, who started it, whether the network can reach it
-strays --battery     # when it last ran flat and how fast it drained
+strays --battery     # when it last ran flat, last night's sleep, energy by app since unplugging
+strays --update      # git pull (if there's a remote) and reinstall: how the other Macs stay current
 strays --session-end # for the Claude Code hook (reads the hook JSON on stdin)
 ```
 
@@ -108,5 +121,7 @@ the panel is open. A battery sample is appended every 5 minutes (about 200 bytes
   as unknown. Launch records are kept in `~/Library/Application Support/Strays/provenance.json`, so
   they survive app restarts.
 - The power log only goes back about a week, so "ran flat" history starts there.
+- Energy per app covers your own processes. The display, WindowServer (graphics) and macOS itself
+  can't be measured per process; the panel says how much the battery supplied in total, for comparison.
 - Watts come from `proc_pid_rusage` v6, which needs macOS 14. On macOS 13 rows show CPU only.
 - Only your own processes are inspected; root daemons are out of scope.

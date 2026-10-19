@@ -21,6 +21,18 @@ enum Prefs {
         get { UserDefaults.standard.object(forKey: "notifyLeftovers") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "notifyLeftovers") }
     }
+
+    /// Auto-stop leftovers from ended Claude sessions older than this many hours; 0 = off.
+    static var autoCleanupHours: Int {
+        get { UserDefaults.standard.integer(forKey: "autoCleanupHours") }
+        set { UserDefaults.standard.set(newValue, forKey: "autoCleanupHours") }
+    }
+
+    /// The last battery death we've already told the user about.
+    static var lastReportedDeath: Date {
+        get { UserDefaults.standard.object(forKey: "lastReportedDeath") as? Date ?? .distantPast }
+        set { UserDefaults.standard.set(newValue, forKey: "lastReportedDeath") }
+    }
 }
 
 @MainActor
@@ -39,6 +51,8 @@ final class Store: ObservableObject {
     static let hotNotifyAfter: TimeInterval = ProcessInfo.processInfo.environment["STRAYS_HOT_AFTER"].flatMap(TimeInterval.init) ?? 600
     /// Claude sessions idle and older than this are offered for "End idle".
     static let idleSessionAge: TimeInterval = 86_400
+    /// Auto-cleanup announces itself this long before stopping anything.
+    static let cleanupNotice: TimeInterval = 600
 
     /// What the panel draws. Only published while it's open, and only when something on
     /// screen actually changed.
@@ -71,11 +85,22 @@ final class Store: ObservableObject {
     private var notifiedHot: Set<String> = []
     private var handledSessionEnds: Set<String> = []
 
+    /// Energy per app since the charger came out (kept after plugging in, until the next unplug).
+    private var ledger: EnergyLedger?
+    private var ledgerChecked = false
+    private var lastOnAC: Bool?
+    private var lastLedgerSave = Date.distantPast
+    /// Auto-cleanup: stray id → when it will be stopped.
+    private var pendingCleanup: [String: Date] = [:]
+
     private init() {
         ignored = Set(UserDefaults.standard.stringArray(forKey: "ignored") ?? [])
         HistoryStore.prune()
         samples = HistoryStore.load(since: Date().addingTimeInterval(-7 * 86_400))
         story = BatteryStory(log: nil, samples: samples)
+        ledger = EnergyLedger.load()
+        // Don't report battery deaths from before Strays was installed.
+        if UserDefaults.standard.object(forKey: "lastReportedDeath") == nil { Prefs.lastReportedDeath = Date() }
     }
 
     // MARK: Publishing
@@ -96,9 +121,10 @@ final class Store: ObservableObject {
     private func publishPanel() {
         guard isOpen else { return }
         let next = PanelModel(PanelInputs(
-            report: latest.report, battery: latest.battery, story: story, warnings: warnings,
+            report: latest.report, battery: latest.battery, story: story, ledger: ledger, warnings: warnings,
             containers: containers, pages: pages, stopping: stopping, ignored: ignored,
-            showIgnored: showIgnored, showLegend: showLegend, idleAge: Self.idleSessionAge
+            showIgnored: showIgnored, showLegend: showLegend, idleAge: Self.idleSessionAge,
+            pendingCleanup: pendingCleanup
         ))
         if next != panel { panel = next }
     }
@@ -114,11 +140,34 @@ final class Store: ObservableObject {
         }
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
-        ) { [engine] _ in engine.flush() }
+        ) { [engine] _ in
+            engine.flush()
+            MainActor.assumeIsolated { Store.shared.ledger?.save() }
+        }
+        // After a wake: if the battery was nearly empty before, it probably ran flat. Say why.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                guard let last = Store.shared.samples.last, last.percent <= 5, !last.onAC else { return }
+                Task {
+                    try? await Task.sleep(nanoseconds: 20_000_000_000)
+                    await Store.shared.reportBatteryDeaths()
+                }
+            }
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            await reportBatteryDeaths()
+        }
         restartLoop()
     }
 
+    /// Debug snapshots render even when the screen is off or the window is covered.
+    var pinnedOpen = false
+
     func setOpen(_ open: Bool) {
+        if pinnedOpen, !open { return }
         guard open != isOpen else { return }
         isOpen = open
         if open {
@@ -150,8 +199,10 @@ final class Store: ObservableObject {
     func refresh() async {
         latest = await engine.scan()
         updateBadge()
+        updateLedger()
         recordHistory()
         trackHot()
+        runAutoCleanup()
         guard isOpen else { return }
         if Date().timeIntervalSince(lastExtras) >= Self.extrasInterval {
             lastExtras = Date()
@@ -169,7 +220,7 @@ final class Store: ObservableObject {
         if probeSettings { lastSettings = Date() }
 
         async let system = Task.detached { probeSettings ? SystemProbe.read() : nil }.value
-        async let docker = Task.detached { hasDocker ? (Docker.containers() ?? []) : [] }.value
+        async let docker = Task.detached { hasDocker ? (Docker.containersWithStats() ?? []) : [] }.value
         var newPages: [String: [DevToolsPage]] = [:]
         for browser in browsers {
             if let port = browser.devtoolsPort { newPages[browser.id] = await DevTools.pages(port: port) }
@@ -178,6 +229,116 @@ final class Store: ObservableObject {
         containers = await docker
         pages = newPages
         readPowerLogIfStale()
+    }
+
+    // MARK: Energy by app
+
+    private func updateLedger() {
+        guard let b = latest.battery, let snapshot = latest.snapshot else { return }
+        let now = Date()
+        defer { lastOnAC = b.onExternalPower }
+        guard !b.onExternalPower else {
+            // Plugged in: keep showing the last discharge; save it once.
+            if lastOnAC == false { ledger?.save() }
+            return
+        }
+        let unplugged = lastOnAC == true
+        let stale = ledger.map { now.timeIntervalSince($0.savedAt) > 900 } ?? true
+        if unplugged || (!ledgerChecked && stale) || ledger == nil {
+            ledger = EnergyLedger(since: now, startPercent: b.percent)
+            ledger?.fromUnplug = unplugged
+        }
+        ledgerChecked = true
+        ledger?.update(snapshot: snapshot, report: latest.report, now: now)
+        if now.timeIntervalSince(lastLedgerSave) >= Self.historyInterval {
+            lastLedgerSave = now
+            ledger?.save()
+        }
+    }
+
+    // MARK: Battery death post-mortem
+
+    /// Tells the user about any battery death since the last one reported, with what used the
+    /// energy during that discharge if Strays was measuring it.
+    func reportBatteryDeaths() async {
+        guard !readingPowerLog else { return }
+        readingPowerLog = true
+        let summary = await Task.detached(priority: .utility) { PowerLog.read() }.value
+        readingPowerLog = false
+        guard let summary else { return }
+        powerLog = summary
+        story = BatteryStory(log: powerLog, samples: samples)
+        publishPanel()
+
+        // STRAYS_DEATH_LOOKBACK=<seconds> widens the window for testing.
+        let lookback = ProcessInfo.processInfo.environment["STRAYS_DEATH_LOOKBACK"].flatMap(TimeInterval.init) ?? 86_400
+        let fresh = summary.deaths.filter { $0.at > Prefs.lastReportedDeath && $0.at > Date().addingTimeInterval(-lookback) }
+        guard let death = fresh.last else { return }
+        Prefs.lastReportedDeath = death.at
+        var body = ""
+        if let start = death.unpluggedAt, let pct = death.startPercent {
+            body = "\(pct)% → 1% in \(Fmt.duration(death.at.timeIntervalSince(start))) after unplugging."
+        }
+        if let ledger, ledger.since <= death.at, ledger.savedAt >= death.at.addingTimeInterval(-900), ledger.total > 0.1 {
+            body += " Biggest users: " + ledger.top(3).map { "\($0.name) \(Fmt.energy($0.wh))" }.joined(separator: ", ") + "."
+        }
+        ActivityLog.write("battery ran flat at \(death.at): \(body)")
+        Notifier.shared.post(
+            id: "death-\(Int(death.at.timeIntervalSince1970))",
+            title: "Your Mac ran out of battery at \(death.at.formatted(date: .omitted, time: .shortened))",
+            body: body.isEmpty ? "Open Strays to see what was running." : body,
+            category: Notifier.Category.info, refs: []
+        )
+    }
+
+    // MARK: Auto-cleanup (opt-in)
+
+    /// Announces leftovers from ended Claude sessions that are old and idle, then stops them
+    /// 10 minutes later unless kept. Off unless chosen in Settings.
+    private func runAutoCleanup() {
+        let hours = Prefs.autoCleanupHours
+        guard hours > 0 else {
+            if !pendingCleanup.isEmpty { pendingCleanup.removeAll(); publishPanel() }
+            return
+        }
+        let now = Date()
+        let eligible = AutoCleanup.eligible(latest.report.hidden, ignored: ignored, olderThan: Double(hours) * 3_600, now: now)
+        let eligibleIds = Set(eligible.map(\.id))
+        pendingCleanup = pendingCleanup.filter { eligibleIds.contains($0.key) }
+
+        let newcomers = eligible.filter { pendingCleanup[$0.id] == nil }
+        if !newcomers.isEmpty {
+            for s in newcomers { pendingCleanup[s.id] = now.addingTimeInterval(Self.cleanupNotice) }
+            let names = newcomers.map(\.title)
+            ActivityLog.write("auto-cleanup scheduled in 10 min: " + names.joined(separator: ", "))
+            Notifier.shared.post(
+                id: "cleanup-\(Int(now.timeIntervalSince1970))",
+                title: "Stopping \(newcomers.count) leftover\(newcomers.count == 1 ? "" : "s") from ended Claude sessions in 10 minutes",
+                body: names.prefix(4).joined(separator: ", ") + (names.count > 4 ? " and \(names.count - 4) more" : ""),
+                category: Notifier.Category.cleanup, refs: newcomers.flatMap(\.members),
+                signatures: newcomers.map(\.signature)
+            )
+        }
+
+        let due = eligible.filter { (pendingCleanup[$0.id] ?? .distantFuture) <= now }
+        if !due.isEmpty {
+            ActivityLog.write("auto-cleanup stopped: " + due.map(\.title).joined(separator: ", "))
+            for s in due { pendingCleanup.removeValue(forKey: s.id) }
+            stop(members: due.flatMap(\.members), ids: due.map(\.id), force: false)
+        }
+        publishPanel()
+    }
+
+    func cleanupNow() {
+        let ids = Array(pendingCleanup.keys)
+        pendingCleanup.removeAll()
+        stopAll(ids)
+    }
+
+    func keepPendingCleanup() {
+        let signatures = pendingCleanup.keys.compactMap { stray($0)?.signature }
+        pendingCleanup.removeAll()
+        ignore(signatures: signatures)
     }
 
     private func readPowerLogIfStale() {
@@ -320,6 +481,12 @@ final class Store: ObservableObject {
         stop(members: strays.flatMap(\.members), ids: strays.map(\.id), force: false)
     }
 
+    /// Every copy but the newest.
+    func stopDuplicates(_ groupId: String) {
+        guard let group = latest.report.duplicates.first(where: { $0.id == groupId }) else { return }
+        stopAll(group.extraIds)
+    }
+
     /// Hidden servers other devices on the network can reach.
     func stopExposed() {
         stopAll(visible(latest.report.hidden).filter(\.isExposed).map(\.id))
@@ -376,6 +543,10 @@ final class Store: ObservableObject {
 
     func ignore(signature: String) {
         updateIgnored { $0.insert(signature) }
+    }
+
+    func ignore(signatures: [String]) {
+        updateIgnored { $0.formUnion(signatures) }
     }
 
     private func updateIgnored(_ change: (inout Set<String>) -> Void) {

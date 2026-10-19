@@ -215,6 +215,20 @@ public struct SleepBlocker: Codable, Hashable, Sendable, Identifiable {
     public var canStop: Bool
 }
 
+/// Several copies of the same thing left running in the same folder, e.g. five
+/// `server/index.js` in games/panel-skirmish, usually from sessions that didn't know one was up.
+public struct DuplicateGroup: Codable, Hashable, Sendable, Identifiable {
+    public var id: String
+    public var title: String
+    public var place: String?
+    /// Oldest first.
+    public var strayIds: [String]
+    /// The newest copy, which "keep newest" leaves running.
+    public var keepId: String
+
+    public var extraIds: [String] { strayIds.filter { $0 != keepId } }
+}
+
 public struct Report: Codable, Sendable {
     /// Orphans and automation browsers: the things nobody is looking at.
     public var hidden: [Stray]
@@ -222,13 +236,16 @@ public struct Report: Codable, Sendable {
     public var sleepBlockers: [SleepBlocker]
     /// VMs, simulators, emulators.
     public var machines: [Stray]
+    public var duplicates: [DuplicateGroup]
     public var generatedAt: Date
 
-    public init(hidden: [Stray], claudeSessions: [ClaudeSession], sleepBlockers: [SleepBlocker], machines: [Stray], generatedAt: Date) {
+    public init(hidden: [Stray], claudeSessions: [ClaudeSession], sleepBlockers: [SleepBlocker], machines: [Stray],
+                duplicates: [DuplicateGroup] = [], generatedAt: Date) {
         self.hidden = hidden
         self.claudeSessions = claudeSessions
         self.sleepBlockers = sleepBlockers
         self.machines = machines
+        self.duplicates = duplicates
         self.generatedAt = generatedAt
     }
 

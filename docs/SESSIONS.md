@@ -72,3 +72,31 @@ Corrected the morning's drain figure. The Mac charged from 09:35 to 12:15, then 
 
 Open: notifications showed "not allowed" on this Mac after install, either a dismissed prompt or macOS
 refusing the ad-hoc-signed app. Needs a System Settings toggle by Joe; unverified which.
+
+## 2026-10-18/19: session briefing, duplicates, energy by app, sleep summary, post-mortem, auto-cleanup, Docker, --update
+
+- **SessionStart hook** (`strays --session-start`, `SessionStart.swift`): lists what's already running in
+  the new session's git project as `additionalContext`. The pipe-test of the real hook command produced
+  the expected JSON for games/gradient-descent and nothing for a project with nothing running.
+- **Duplicates** (`Classifier.duplicates`): same kind + cwd + title with port numbers removed. Panel offers
+  "Keep newest, stop N"; also noted in the session briefing.
+- **Energy by app** (`EnergyLedger`): per-process energy-counter deltas grouped by app bundle or by
+  hidden / Claude / VM group. Accumulates only on battery, resets on unplug, saved to energy.json every 5 minutes,
+  and kept after plugging in ("last time on battery").
+- **Sleep summary**: `PowerLog` now tracks sleep → full wake (a `V` in flags like [CDNVA]), counting DarkWakes.
+- **Battery post-mortem**: 60 s after launch, and after a wake when the last sample was ≤5%, re-reads the
+  power log and notifies about deaths newer than `lastReportedDeath`. That's set to install time, so old deaths
+  aren't reported. Tested with `STRAYS_DEATH_LOOKBACK`.
+- **Auto-cleanup** (opt-in): `AutoCleanup.eligible` covers ended-Claude-session orphans and browsers that are idle and
+  older than N hours. Announced 10 minutes ahead, with Stop now / Keep them. The live flow is untested (nothing old
+  enough was running); eligibility is unit-tested.
+- **Docker**: quit asks first and lists the containers it will stop. Each container shows `docker stats` CPU and
+  memory. Quit uses `docker desktop stop`, then stops leftovers: quitting "Docker" by name only stops the engine
+  (com.docker.docker), not the window app (com.electron.dockerdesktop).
+- **`strays --update`**: install.sh records the source path. Pulls if there's an upstream (there is:
+  J-Glatter/strays), then reinstalls.
+- Hook installer now manages both hooks. Tested on a copy: adds only what's missing, idempotent, and uninstall
+  restores the pre-hook file byte for byte.
+- Snapshots need `--snapshot` to pin the panel open: with the display asleep (displaysleep 5 now) every window
+  reads as occluded.
+- 49 tests.

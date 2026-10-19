@@ -92,9 +92,25 @@ public enum PowerLog {
         }
     }
 
+    /// One stretch of sleep: from going to sleep to the next wake with the display on.
+    public struct SleepSession: Codable, Hashable, Sendable {
+        public var start: Date
+        public var end: Date
+        public var startPercent: Int?
+        public var endPercent: Int?
+        /// Brief background wake-ups (network upkeep, scheduled tasks) during it.
+        public var darkWakes: Int
+
+        public var used: Int? {
+            guard let a = startPercent, let b = endPercent, a >= b else { return nil }
+            return a - b
+        }
+    }
+
     public struct Summary: Codable, Hashable, Sendable {
         public var points: [Point]
         public var deaths: [Death]
+        public var sleeps: [SleepSession] = []
         public var readAt: Date
     }
 
@@ -107,14 +123,27 @@ public enum PowerLog {
     public static func parse(_ log: String, now: Date = Date()) -> Summary {
         var points: [Point] = []
         var deathTimes: [Date] = []
+        var sleeps: [SleepSession] = []
+        var asleep: (start: Date, percent: Int?, dark: Int)?
         for line in log.split(separator: "\n", omittingEmptySubsequences: true) {
             // Cheap checks first: date parsing is the slow part and most lines don't need it.
             let reading = reading(in: line)
             let isDeath = line.contains("'Low Power Sleep'")
-            guard reading != nil || isDeath, line.first?.isNumber == true, line.count > 25,
+            let event = sleepEvent(line)
+            guard reading != nil || isDeath || event != nil, line.first?.isNumber == true, line.count > 25,
                   let date = timestamp.date(from: String(line.prefix(25))) else { continue }
             if let reading { points.append(Point(at: date, percent: reading.percent, onAC: reading.onAC)) }
             if isDeath { deathTimes.append(date) }
+            switch event {
+            case .sleep?: if asleep == nil { asleep = (date, reading?.percent, 0) }
+            case .darkWake?: asleep?.dark += 1
+            case .fullWake?:
+                if let a = asleep {
+                    sleeps.append(SleepSession(start: a.start, end: date, startPercent: a.percent, endPercent: reading?.percent, darkWakes: a.dark))
+                }
+                asleep = nil
+            case nil: break
+            }
         }
 
         let deaths = deathTimes.map { death -> Death in
@@ -133,7 +162,25 @@ public enum PowerLog {
             if let last = thinned.last, p.at.timeIntervalSince(last.at) < 300, p.onAC == last.onAC { continue }
             thinned.append(p)
         }
-        return Summary(points: thinned, deaths: deaths, readAt: now)
+        let recentSleeps = sleeps.filter { $0.end >= now.addingTimeInterval(-48 * 3_600) }
+        return Summary(points: thinned, deaths: deaths, sleeps: recentSleeps, readAt: now)
+    }
+
+    enum SleepEvent { case sleep, darkWake, fullWake }
+
+    /// The event kind sits right after the 25-character timestamp. A full wake turns the
+    /// display on ("V" in flags like [CDNVA]); dark wakes have their own kind.
+    static func sleepEvent(_ line: Substring) -> SleepEvent? {
+        guard line.count > 30 else { return nil }
+        let rest = line.dropFirst(26)
+        if rest.hasPrefix("Sleep ") { return rest.contains("Entering Sleep state") ? .sleep : nil }
+        if rest.hasPrefix("DarkWake ") { return .darkWake }
+        if rest.hasPrefix("Wake "), rest.contains("Wake from"),
+           let open = rest.firstIndex(of: "["), let close = rest[open...].firstIndex(of: "]"),
+           rest[open..<close].contains("V") {
+            return .fullWake
+        }
+        return nil
     }
 
     /// "Using BATT (Charge:49%)", "Using Batt(Charge: 49)", "Using AC (Charge:100%)"
@@ -163,8 +210,11 @@ public struct BatteryStory: Sendable, Equatable {
     public var lastDeathLine: String?
     public var lastDeathDetail: String?
     public var deathsThisWeek: Int
+    /// The most recent sleep of an hour or more in the last day.
+    public var lastSleep: PowerLog.SleepSession?
 
     public init(log: PowerLog.Summary?, samples: [HistorySample], now: Date = Date()) {
+        lastSleep = log?.sleeps.last { $0.end.timeIntervalSince($0.start) >= 3_600 && $0.end >= now.addingTimeInterval(-24 * 3_600) }
         var points = log?.points ?? []
         points += samples.map { PowerLog.Point(at: $0.at, percent: $0.percent, onAC: $0.onAC) }
         let dayAgo = now.addingTimeInterval(-24 * 3_600)

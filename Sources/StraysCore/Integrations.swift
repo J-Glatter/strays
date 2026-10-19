@@ -70,6 +70,9 @@ public struct DockerContainer: Codable, Hashable, Sendable, Identifiable {
     public var image: String
     public var status: String
     public var ports: String
+    /// From `docker stats`, e.g. "0.31%" and "45MiB / 7.6GiB".
+    public var cpu: String?
+    public var memory: String?
 }
 
 public enum Docker {
@@ -96,6 +99,29 @@ public enum Docker {
             guard let row = try? JSONDecoder().decode(Row.self, from: Data(line.utf8)) else { return nil }
             return DockerContainer(id: row.ID, name: row.Names, image: row.Image, status: row.Status, ports: row.Ports ?? "")
         }
+    }
+
+    /// Containers with their current CPU and memory. `docker stats --no-stream` takes a second
+    /// or two, so this only runs while the panel is open.
+    public static func containersWithStats() -> [DockerContainer]? {
+        guard var list = containers(), !list.isEmpty, let docker = binary,
+              let result = Shell.run(docker, ["stats", "--no-stream", "--format", "{{json .}}"], timeout: 10),
+              result.status == 0 else { return containers() }
+        struct Stat: Decodable {
+            let ID: String
+            let CPUPerc: String
+            let MemUsage: String
+        }
+        var byID: [String: Stat] = [:]
+        for line in result.output.split(separator: "\n") {
+            if let stat = try? JSONDecoder().decode(Stat.self, from: Data(line.utf8)) { byID[stat.ID] = stat }
+        }
+        for i in list.indices {
+            let stat = byID[list[i].id] ?? byID.first { list[i].id.hasPrefix($0.key) || $0.key.hasPrefix(list[i].id) }?.value
+            list[i].cpu = stat?.CPUPerc
+            list[i].memory = stat?.MemUsage.split(separator: "/").first.map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        return list
     }
 
     public static func stop(containerID: String) {
